@@ -2,6 +2,7 @@
 
 import { Suspense } from "react";
 import { setTimeout } from "timers/promises";
+import { Stream } from "openai/streaming";
 
 const getWeather = async () => {
   await setTimeout(2_000);
@@ -14,9 +15,14 @@ async function* generateWeatherComponent({ location }: { location: string }) {
   const weather = await getWeather();
 
   return (
-    <div className={"max-w-md w-full border border-red-100"}>
-      <p>Weather in Poznan is {weather}</p>
-      <span>{location}</span>
+    <div className={"w-full border p-5"}>
+      <p>
+        Weather in {location} is {weather}
+      </p>
+      <p>
+        You asked for weather in location:{" "}
+        <span className={"font-bold"}>{location}</span>
+      </p>
     </div>
   );
 }
@@ -43,8 +49,6 @@ async function Recursive({
       </>
     );
   }
-
-  console.log("im here", chunk.value, chunk.next);
 
   return (
     <Suspense fallback={chunk.value}>
@@ -73,7 +77,7 @@ function createSuspendedChunk() {
       <Suspense>
         <Recursive current={null} next={promise} />
       </Suspense>
-    ),
+    ) as React.ReactNode,
     resolve,
     reject
   };
@@ -118,7 +122,7 @@ function createStreamableUI() {
   return streamable;
 }
 
-export async function someAction(prevState: any, formData: FormData) {
+export async function someAction({ message }: { message: string }) {
   const ui = createStreamableUI();
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -136,7 +140,7 @@ export async function someAction(prevState: any, formData: FormData) {
         },
         {
           role: "user",
-          content: "What is the weather in Poznan?"
+          content: message
         }
       ],
       tools: [
@@ -150,7 +154,7 @@ export async function someAction(prevState: any, formData: FormData) {
               properties: {
                 location: {
                   type: "string",
-                  description: "The location to get the weather for"
+                  description: "Gets weather for a given location."
                 }
               }
             }
@@ -161,12 +165,13 @@ export async function someAction(prevState: any, formData: FormData) {
     })
   });
 
-  if (!response.body) {
-    return;
-  }
+  const stream = Stream.fromSSEResponse(response, new AbortController())
+    .toReadableStream()
+    .pipeThrough(new TextDecoderStream())
+    .pipeThrough(new JsonStream());
 
   void consumeStream(
-    { readable: response.body, ui },
+    { stream, ui },
     {
       tools: {
         getWeather: generateWeatherComponent
@@ -179,10 +184,10 @@ export async function someAction(prevState: any, formData: FormData) {
 
 async function consumeStream(
   {
-    readable,
+    stream,
     ui
   }: {
-    readable: ReadableStream<Uint8Array>;
+    stream: ReadableStream<any>;
     ui: ReturnType<typeof createStreamableUI>;
   },
   {
@@ -190,96 +195,75 @@ async function consumeStream(
   }: {
     tools: Record<
       string,
-      (...args: any[]) => AsyncGenerator<JSX.Element, JSX.Element, unknown>
+      (
+        ...args: any[]
+      ) => AsyncGenerator<React.ReactNode, React.ReactNode, unknown>
     >;
   }
 ) {
-  const jsonReader = readable
-    .pipeThrough(new TextDecoderStream())
-    .pipeThrough(new AISanitizationStream())
-    .pipeThrough(new AIJsonStream())
-    .getReader();
+  const reader = stream.getReader();
 
   let functionName = "";
   let functionArgs = "";
-  let startedFunctionCall = false;
 
   while (true) {
-    const { done, value } = await jsonReader.read();
+    const { done, value } = await reader.read();
     if (done) {
       ui.done();
       break;
     }
 
-    const { choices } = value;
-    const choicesDelta = choices[0]?.delta;
+    if (!value) {
+      continue;
+    }
 
-    const content = choicesDelta.content;
-    if (content) {
+    const choices = value.choices;
+    const content = choices[0]?.delta?.content;
+
+    if (content != null) {
       ui.append(content);
     }
 
-    const currentFunctionName = choicesDelta.tool_calls?.[0]?.function?.name;
+    const currentFunctionName =
+      choices[0]?.delta?.tool_calls?.[0]?.function?.name;
     if (currentFunctionName) {
-      startedFunctionCall = true;
       functionName = currentFunctionName;
     }
 
     const currentFunctionArguments =
-      choicesDelta.tool_calls?.[0]?.function?.arguments;
+      choices[0]?.delta?.tool_calls?.[0]?.function?.arguments;
     if (currentFunctionArguments) {
       functionArgs += currentFunctionArguments;
     }
 
-    if (
-      functionName &&
-      !currentFunctionName &&
-      !currentFunctionArguments &&
-      startedFunctionCall
-    ) {
-      const currentFunctionName = functionName;
-      const currentArgs = functionArgs;
+    const hasFunctionToCall =
+      functionName != "" &&
+      currentFunctionName == null &&
+      currentFunctionArguments == null;
 
-      startedFunctionCall = false;
-      functionName = "";
-      functionArgs = "";
+    if (!hasFunctionToCall) {
+      continue;
+    }
 
-      const args = JSON.parse(currentArgs);
-      const it = tools[currentFunctionName](args);
+    const args = JSON.parse(functionArgs);
+    const it = tools[functionName](args);
 
-      while (true) {
-        let { value, done } = await it.next();
+    functionName = "";
+    functionArgs = "";
 
-        ui.update(value);
+    while (true) {
+      let { value, done } = await it.next();
 
-        if (done) {
-          break;
-        }
+      ui.update(value);
+
+      if (done) {
+        break;
       }
     }
   }
 }
 
-class AISanitizationStream extends TransformStream<string, string> {
-  constructor() {
-    super({
-      transform(chunk, controller) {
-        const sanitizedChunk = chunk
-          .trim()
-          .replaceAll("data: ", "")
-          .replaceAll("[DONE]", "")
-          .trim();
-
-        controller.enqueue(sanitizedChunk);
-      },
-      flush(controller) {
-        controller.terminate();
-      }
-    });
-  }
-}
-
-class AIJsonStream extends TransformStream<string, any> {
+class JsonStream extends TransformStream<string, any> {
   constructor() {
     super({
       transform(chunk, controller) {
